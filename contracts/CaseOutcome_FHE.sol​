@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import { FHE, euint32, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { SepoliaConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+
+contract CaseOutcome_FHE is SepoliaConfig {
+    struct EncryptedCase {
+        uint256 caseId;
+        address lawyer;
+        euint32 encryptedLegalStrength;
+        euint32 encryptedEvidenceScore;
+        euint32 encryptedPrecedentScore;
+        euint32 encryptedOpponentStrength;
+        uint256 submissionTime;
+    }
+
+    struct PredictionResult {
+        string predictedOutcome;
+        string confidenceLevel;
+        string strategySuggestion;
+        bool isRevealed;
+    }
+
+    uint256 public caseCount;
+    mapping(uint256 => EncryptedCase) public encryptedCases;
+    mapping(uint256 => PredictionResult) public predictionResults;
+    mapping(uint256 => uint256) private requestToCaseId;
+
+    event CaseSubmitted(uint256 indexed caseId, address indexed lawyer);
+    event AnalysisRequested(uint256 indexed caseId);
+    event PredictionReady(uint256 indexed caseId);
+
+    modifier onlyLawyer(uint256 caseId) {
+        require(msg.sender == encryptedCases[caseId].lawyer, "Not authorized");
+        _;
+    }
+
+    function submitEncryptedCase(
+        euint32 legalStrength,
+        euint32 evidenceScore,
+        euint32 precedentScore,
+        euint32 opponentStrength
+    ) public {
+        caseCount += 1;
+        uint256 newId = caseCount;
+
+        encryptedCases[newId] = EncryptedCase({
+            caseId: newId,
+            lawyer: msg.sender,
+            encryptedLegalStrength: legalStrength,
+            encryptedEvidenceScore: evidenceScore,
+            encryptedPrecedentScore: precedentScore,
+            encryptedOpponentStrength: opponentStrength,
+            submissionTime: block.timestamp
+        });
+
+        predictionResults[newId] = PredictionResult({
+            predictedOutcome: "",
+            confidenceLevel: "",
+            strategySuggestion: "",
+            isRevealed: false
+        });
+
+        emit CaseSubmitted(newId, msg.sender);
+    }
+
+    function requestOutcomePrediction(uint256 caseId) public onlyLawyer(caseId) {
+        require(!predictionResults[caseId].isRevealed, "Already analyzed");
+
+        EncryptedCase storage caseData = encryptedCases[caseId];
+        
+        bytes32[] memory ciphertexts = new bytes32[](4);
+        ciphertexts[0] = FHE.toBytes32(caseData.encryptedLegalStrength);
+        ciphertexts[1] = FHE.toBytes32(caseData.encryptedEvidenceScore);
+        ciphertexts[2] = FHE.toBytes32(caseData.encryptedPrecedentScore);
+        ciphertexts[3] = FHE.toBytes32(caseData.encryptedOpponentStrength);
+
+        uint256 reqId = FHE.requestDecryption(ciphertexts, this.analyzeCase.selector);
+        requestToCaseId[reqId] = caseId;
+
+        emit AnalysisRequested(caseId);
+    }
+
+    function analyzeCase(
+        uint256 requestId,
+        bytes memory cleartexts,
+        bytes memory proof
+    ) public {
+        uint256 caseId = requestToCaseId[requestId];
+        require(caseId != 0, "Invalid request");
+
+        PredictionResult storage result = predictionResults[caseId];
+        require(!result.isRevealed, "Already analyzed");
+
+        FHE.checkSignatures(requestId, cleartexts, proof);
+
+        uint32[] memory scores = abi.decode(cleartexts, (uint32[]));
+        uint32 totalScore = (scores[0] * 3 + scores[1] * 2 + scores[2] * 2) - scores[3];
+
+        (result.predictedOutcome, result.confidenceLevel, result.strategySuggestion) = 
+            _calculatePrediction(totalScore);
+        result.isRevealed = true;
+
+        emit PredictionReady(caseId);
+    }
+
+    function _calculatePrediction(uint32 score) private pure returns (
+        string memory, 
+        string memory, 
+        string memory
+    ) {
+        if (score > 800) {
+            return ("Highly Favorable", "90%+", "Aggressive litigation strategy recommended");
+        } else if (score > 600) {
+            return ("Favorable", "70-90%", "Standard litigation with settlement options");
+        } else if (score > 400) {
+            return ("Neutral", "50-70%", "Consider mediation or alternative dispute resolution");
+        } else if (score > 200) {
+            return ("Unfavorable", "30-50%", "Focus on damage control and settlement");
+        } else {
+            return ("Highly Unfavorable", "<30%", "Strongly consider settlement or plea bargain");
+        }
+    }
+
+    function getPrediction(uint256 caseId) public view onlyLawyer(caseId) returns (
+        string memory outcome,
+        string memory confidence,
+        string memory strategy,
+        bool isRevealed
+    ) {
+        PredictionResult storage r = predictionResults[caseId];
+        return (r.predictedOutcome, r.confidenceLevel, r.strategySuggestion, r.isRevealed);
+    }
+
+    function getCaseSubmissionTime(uint256 caseId) public view onlyLawyer(caseId) returns (uint256) {
+        return encryptedCases[caseId].submissionTime;
+    }
+
+    function calculateEncryptedScore(uint256 caseId) public view returns (euint32) {
+        EncryptedCase storage c = encryptedCases[caseId];
+        euint32 weightedLegal = FHE.mul(c.encryptedLegalStrength, FHE.asEuint32(3));
+        euint32 weightedEvidence = FHE.mul(c.encryptedEvidenceScore, FHE.asEuint32(2));
+        euint32 weightedPrecedent = FHE.mul(c.encryptedPrecedentScore, FHE.asEuint32(2));
+        
+        euint32 positiveFactors = FHE.add(
+            FHE.add(weightedLegal, weightedEvidence),
+            weightedPrecedent
+        );
+        
+        return FHE.sub(positiveFactors, c.encryptedOpponentStrength);
+    }
+}
